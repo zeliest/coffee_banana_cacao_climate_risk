@@ -446,7 +446,8 @@ def compute_additional_canopy_cost(
     setup_cost_per_ha=300,
     annual_maint_cost_per_ha=30,
     duration_years=10,
-    default_hektar_per_site=5
+    default_hektar_per_site=5,
+    discount_rate=0.0  # e.g., 0.05 for 5% per year
 ):
     """
     Compute cost and canopy area needed to reach a minimum canopy threshold.
@@ -458,10 +459,11 @@ def compute_additional_canopy_cost(
     - annual_maint_cost_per_ha: Annual maintenance cost per hectare (USD)
     - duration_years: Maintenance period (years)
     - default_hektar_per_site: Default area per site if missing
+    - discount_rate: Annual discount rate (0.05 = 5% per year)
 
     Returns:
-    - total_cost: float, total cost across all sites
-    - site_costs: pd.Series of site-specific costs
+    - total_cost: float, total NPV cost across all sites
+    - site_costs: pd.Series of site-specific NPV costs
     - total_planted_hectares: float, total new canopy hectares needed
     """
     import pandas as pd
@@ -470,7 +472,6 @@ def compute_additional_canopy_cost(
     current_frac = current_cover / 100
     target_frac = min_canopy_percent / 100
 
-    # Only plant if under target
     deficit_frac = (target_frac - current_frac).clip(lower=0)
 
     if "harvest_area (ha)" in exp.gdf.columns:
@@ -478,16 +479,26 @@ def compute_additional_canopy_cost(
     else:
         area_ha = pd.Series(default_hektar_per_site, index=exp.gdf.index)
 
-    # Hectares of canopy to be planted per site
     planted_ha = area_ha * deficit_frac
 
-    # Cost calculation
-    site_costs = planted_ha * (setup_cost_per_ha + annual_maint_cost_per_ha * duration_years)
+    # --- NPV of maintenance costs ---
+    if discount_rate == 0:
+        maint_npv_per_ha = annual_maint_cost_per_ha * duration_years
+    else:
+        maint_npv_per_ha = sum(
+            annual_maint_cost_per_ha / ((1 + discount_rate) ** t)
+            for t in range(1, duration_years + 1)
+        )
+
+    # Total cost per site
+    cost_per_ha = setup_cost_per_ha + maint_npv_per_ha
+    site_costs = planted_ha * cost_per_ha
 
     total_cost = site_costs.sum()
     total_planted_hectares = planted_ha.sum()
 
     return total_cost, site_costs, total_planted_hectares
+
 
 
 def generate_random_impact_func_from_ci(
