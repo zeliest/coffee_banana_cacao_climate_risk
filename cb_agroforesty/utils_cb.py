@@ -34,11 +34,11 @@ COUNTRY_BOUNDS = {'MEX': {# Define bounding box for Mexico and Guatemala
 }
 
 # Define file paths for crop production data
-FILES_CROP_PROD = { "coffee": "Spam/spam2020V1r0_global_production 2/spam2020_v1r0_global_P_COFF_A.tif"}
+FILES_CROP_PROD = { "coffee": "Spam/spam2020V1r0_global_production/spam2020_v1r0_global_P_COFF_A.tif"}
 FILES_CROP_HARVEST = { "coffee": "Spam/spam2020V1r0_global_harvested_area/spam2020_v1r0_global_H_COFF_A.tif"}
 
 # Make a function that returns the exposure object given the bbox
-def get_crop_prod_exposure(file, bbox, hazard_type, harvest_area_file=None):
+def get_crop_prod_exposure(file, bbox, harvest_area_file=None):
     """
     Returns an Exposures object cropped to a bounding box, with optional harvested area added.
     
@@ -54,7 +54,6 @@ def get_crop_prod_exposure(file, bbox, hazard_type, harvest_area_file=None):
     """
     # Load exposure
     exp = Exposures.from_raster(file)
-    exp.gdf[f'impf_{hazard_type}'] = 1
 
     # Add coordinate column with rounding for matching
     exp.gdf["coord"] = list(zip(
@@ -348,9 +347,17 @@ def compute_vpd_hazard(exp, tas_gs, hurs_gs, canopy_scenario="current", cooling_
 
     # Step 6: Package
     t0 = time.time()
-    intensity = sparse.csr_matrix(vpd_yr.values)
+    # Optional — Zero out small values (helps sparsity)
+    vpd_array = vpd_yr.values
+    vpd_array[np.abs(vpd_array) < 0.4] = 0 # Convert small values to zero to speed up packaging
+    # Use faster constructor
+    intensity = sparse.csr_matrix(vpd_array)
     if np.isnan(intensity.data).any():
         raise ValueError("NaNs in VPD intensity matrix.")
+    timings["packaging"] = time.time() - t0
+    
+    # Step 7: Create Hazard object
+    t0 = time.time()
     hazard = Hazard(
         haz_type="VPD",
         intensity=intensity,
@@ -362,7 +369,7 @@ def compute_vpd_hazard(exp, tas_gs, hurs_gs, canopy_scenario="current", cooling_
         date=np.array([pd.Timestamp(f"{y}-01-01").toordinal() for y in years]),
         event_name=[f"year_{y}" for y in years]
     )
-    timings["packaging"] = time.time() - t0
+    timings["hazard"] = time.time() - t0
 
     # Step 7: Return hazard and timings
     if return_timings:
@@ -439,7 +446,8 @@ def compute_additional_canopy_cost(
     setup_cost_per_ha=300,
     annual_maint_cost_per_ha=30,
     duration_years=10,
-    default_hektar_per_site=5
+    default_hektar_per_site=5,
+    discount_rate=0.0  # e.g., 0.05 for 5% per year
 ):
     """
     Compute cost and canopy area needed to reach a minimum canopy threshold.
@@ -451,10 +459,11 @@ def compute_additional_canopy_cost(
     - annual_maint_cost_per_ha: Annual maintenance cost per hectare (USD)
     - duration_years: Maintenance period (years)
     - default_hektar_per_site: Default area per site if missing
+    - discount_rate: Annual discount rate (0.05 = 5% per year)
 
     Returns:
-    - total_cost: float, total cost across all sites
-    - site_costs: pd.Series of site-specific costs
+    - total_cost: float, total NPV cost across all sites
+    - site_costs: pd.Series of site-specific NPV costs
     - total_planted_hectares: float, total new canopy hectares needed
     """
     import pandas as pd
@@ -463,7 +472,6 @@ def compute_additional_canopy_cost(
     current_frac = current_cover / 100
     target_frac = min_canopy_percent / 100
 
-    # Only plant if under target
     deficit_frac = (target_frac - current_frac).clip(lower=0)
 
     if "harvest_area (ha)" in exp.gdf.columns:
@@ -471,16 +479,26 @@ def compute_additional_canopy_cost(
     else:
         area_ha = pd.Series(default_hektar_per_site, index=exp.gdf.index)
 
-    # Hectares of canopy to be planted per site
     planted_ha = area_ha * deficit_frac
 
-    # Cost calculation
-    site_costs = planted_ha * (setup_cost_per_ha + annual_maint_cost_per_ha * duration_years)
+    # --- NPV of maintenance costs ---
+    if discount_rate == 0:
+        maint_npv_per_ha = annual_maint_cost_per_ha * duration_years
+    else:
+        maint_npv_per_ha = sum(
+            annual_maint_cost_per_ha / ((1 + discount_rate) ** t)
+            for t in range(1, duration_years + 1)
+        )
+
+    # Total cost per site
+    cost_per_ha = setup_cost_per_ha + maint_npv_per_ha
+    site_costs = planted_ha * cost_per_ha
 
     total_cost = site_costs.sum()
     total_planted_hectares = planted_ha.sum()
 
     return total_cost, site_costs, total_planted_hectares
+
 
 
 def generate_random_impact_func_from_ci(
@@ -625,37 +643,37 @@ def plot_aai_kde_colored_means(output_dict, ax, *, to_percent=False, y_label="De
     ax.grid(True)
 
     
-def plot_kde_and_rp_panels(output_imp, scaled_price_imp):
+# def plot_kde_and_rp_panels(output_imp, scaled_price_imp):
 
-    kde_configs = [
-        {"data": output_imp["unscaled"], "title": "Absolute AAI (Production Volume)"},
-        {"data": output_imp["scaled"], "title": "Relative AAI (Share of Total Production)", "to_percent": True},
-        {"data": scaled_price_imp, "title": "Economic AAI (Market Value in USD)"}
-    ]
+#     kde_configs = [
+#         {"data": output_imp["unscaled"], "title": "Absolute AAI (Production Volume)"},
+#         {"data": output_imp["scaled"], "title": "Relative AAI (Share of Total Production)", "to_percent": True},
+#         {"data": scaled_price_imp, "title": "Economic AAI (Market Value in USD)"}
+#     ]
 
-    rp_configs = [
-        {"data": output_imp["unscaled"], "title": "Absolute RP Curve", "y_label": "Impact [k tonnes]"},
-        {"data": output_imp["scaled"], "title": "Relative RP Curve", "y_label": "Impact [% of Total]", "value_scale": 100, "percent": True},
-        {"data": scaled_price_imp, "title": "Economic RP Curve", "y_label": "Impact [USD]"}
-    ]
+#     rp_configs = [
+#         {"data": output_imp["unscaled"], "title": "Absolute RP Curve", "y_label": "Impact [k tonnes]"},
+#         {"data": output_imp["scaled"], "title": "Relative RP Curve", "y_label": "Impact [% of Total]", "value_scale": 100, "percent": True},
+#         {"data": scaled_price_imp, "title": "Economic RP Curve", "y_label": "Impact [USD]"}
+#     ]
 
-    fig_kde, axs_kde = plt.subplots(1, 3, figsize=(18, 5), sharey=False)
-    for ax, cfg in zip(axs_kde, kde_configs):
-        plot_aai_kde_colored_means(cfg["data"], ax=ax, title=cfg["title"], to_percent=cfg.get("to_percent", False))
-    fig_kde.tight_layout()
+#     fig_kde, axs_kde = plt.subplots(1, 3, figsize=(18, 5), sharey=False)
+#     for ax, cfg in zip(axs_kde, kde_configs):
+#         plot_aai_kde_colored_means(cfg["data"], ax=ax, title=cfg["title"], to_percent=cfg.get("to_percent", False))
+#     fig_kde.tight_layout()
 
-    fig_rp, axs_rp = plt.subplots(1, 3, figsize=(18, 5))
-    for ax, cfg in zip(axs_rp, rp_configs):
-        plot_uncertainty_curves(
-            cfg["data"],
-            ax=ax,
-            title=cfg["title"],
-            y_label=cfg["y_label"],
-            value_scale=cfg.get("value_scale", 1.0),
-            percent=cfg.get("percent", False)
-        )
-    fig_rp.tight_layout()
-    plt.show()
+#     fig_rp, axs_rp = plt.subplots(1, 3, figsize=(18, 5))
+#     for ax, cfg in zip(axs_rp, rp_configs):
+#         plot_uncertainty_curves(
+#             cfg["data"],
+#             ax=ax,
+#             title=cfg["title"],
+#             y_label=cfg["y_label"],
+#             value_scale=cfg.get("value_scale", 1.0),
+#             percent=cfg.get("percent", False)
+#         )
+#     fig_rp.tight_layout()
+#     plt.show()
 
 def scale_outputs_by_price(output_dict, price_per_ton):
     """
@@ -709,4 +727,529 @@ def plot_kde_and_rp_panels(output_imp, price_per_ton=None):
             percent=cfg.get("percent", False)
         )
     fig_rp.tight_layout()
+    plt.show()
+
+
+    import xarray as xr
+import numpy as np
+import pandas as pd
+from scipy import sparse
+from climada.hazard import Hazard, Centroids
+
+def create_hazard_from_nc_files(
+    nc_files,
+    varname,
+    haz_type="HAZARD",
+    units="unit",
+    agg="max",
+    months=None,             # List of integers, e.g., [4,5,6,7,8,9] for April–September
+    nan_replacement=None     # Value to replace NaNs, e.g., 0.0 or np.nan to skip
+):
+    """
+    Create a CLIMADA Hazard object from NetCDF files.
+
+    Parameters:
+    - nc_files (List[Path or str]): List of NetCDF file paths
+    - varname (str): Variable name to extract (e.g. "tas", "vpd", "tmax")
+    - haz_type (str): Hazard type label
+    - units (str): Units of the variable
+    - agg (str): Aggregation method over time ('max', 'sum', 'mean')
+    - months (List[int], optional): Months (1–12) to include in annual aggregation
+    - nan_replacement (float or None): Value to replace NaNs in the intensity matrix
+
+    Returns:
+    - climada.hazard.Hazard object
+    """
+    print(f"📂 Loading {len(nc_files)} files for variable '{varname}'...")
+    ds_list = [xr.open_dataset(str(f))[varname] for f in nc_files]
+    data = xr.concat(ds_list, dim="time")
+
+    if months:
+        print(f"📆 Filtering to months: {months}")
+        data = data.sel(time=data['time.month'].isin(months))
+
+    print(f"🧮 Aggregating by year using '{agg}'...")
+    grouped = data.groupby("time.year")
+    if agg == "max":
+        data_yr = grouped.max(dim="time")
+    elif agg == "sum":
+        data_yr = grouped.sum(dim="time")
+    elif agg == "mean":
+        data_yr = grouped.mean(dim="time")
+    else:
+        raise ValueError(f"Unsupported aggregation method: {agg}")
+
+    print("📌 Reshaping data to [year, lat*lon] array...")
+    data_flat = data_yr.stack(site=("lat", "lon")).transpose("year", "site")
+    data_arr = data_flat.values
+
+    if nan_replacement is not None:
+        print(f"🔄 Replacing NaNs with {nan_replacement}...")
+        data_arr = np.nan_to_num(data_arr, nan=nan_replacement)
+
+    print("🧱 Converting to sparse matrix...")
+    intensity = sparse.csr_matrix(data_arr)
+
+    print("🗺️ Extracting lat/lon centroids...")
+    latlon = data_flat.site.to_index().to_frame(index=False)
+    centroids = Centroids(lat=latlon["lat"].values, lon=latlon["lon"].values)
+
+    years = data_yr.year.values
+    event_name = [f"year_{y}" for y in years]
+
+    print("📦 Creating Hazard object...")
+    hazard = Hazard(
+        haz_type=haz_type,
+        intensity=intensity,
+        fraction=intensity.copy().astype(bool),
+        centroids=centroids,
+        units=units,
+        event_id=np.arange(len(years)),
+        frequency=np.ones(len(years)) / len(years),
+        date=np.array([pd.Timestamp(f"{y}-01-01").toordinal() for y in years]),
+        event_name=event_name
+    )
+
+    return hazard
+
+
+def reproject_hazard_to_exposures(hazard, exp):
+    """
+    Interpolate a gridded Hazard object to exposure site locations,
+    and return a new Hazard object with site-level columns.
+
+    Parameters:
+    - hazard (Hazard): CLIMADA Hazard object with gridded data
+    - exp (Exposures): CLIMADA Exposures object with site geometries
+    - value_threshold (float): Threshold to zero out small values for sparsity
+
+    Returns:
+    - site_hazard (Hazard): New Hazard object [years x sites]
+    """
+    print("🔁 Interpolating hazard values to exposure coordinates...")
+
+    # Get hazard info
+    n_events, n_grid = hazard.intensity.shape
+    years = np.array([pd.Timestamp.fromordinal(d).year for d in hazard.date])
+    lat = hazard.centroids.lat
+    lon = hazard.centroids.lon
+
+    # Create DataArray from intensity matrix [year x grid]
+    intensity_dense = hazard.intensity.toarray()  # [n_events x n_grid]
+    df = pd.DataFrame({
+        'lat': np.repeat(lat, n_events),
+        'lon': np.repeat(lon, n_events),
+        'year': np.tile(years, n_grid),
+        'value': intensity_dense.T.flatten()
+    })
+
+    # Create 3D DataArray: [year, lat, lon]
+    da = df.set_index(['year', 'lat', 'lon']).to_xarray().value
+
+    # Interpolate to exposure points
+    interp_vals = da.interp(
+        lon=("site", exp.gdf.geometry.x.values),
+        lat=("site", exp.gdf.geometry.y.values),
+        method="nearest"
+    )
+
+    # Prepare intensity matrix: [n_years x n_sites]
+    data_arr = interp_vals.values
+    intensity = sparse.csr_matrix(data_arr)
+
+    # Create site-level Hazard
+    site_hazard = Hazard(
+        haz_type=hazard.haz_type,
+        intensity=intensity,
+        fraction=intensity.copy().astype(bool),
+        centroids=Centroids(lat=exp.gdf.geometry.y.values, lon=exp.gdf.geometry.x.values),
+        units=hazard.units,
+        event_id=np.arange(len(years)),
+        frequency=np.ones(len(years)) / len(years),
+        date=np.array([pd.Timestamp(f"{y}-01-01").toordinal() for y in years]),
+        event_name=[f"year_{y}" for y in years]
+    )
+
+    return site_hazard
+
+
+def apply_canopy_scenario(exp, canopy_scenario="current"):
+    """
+    Return a new exposure object with canopy adjusted to the specified scenario.
+    """
+    from copy import deepcopy
+    new_exp = deepcopy(exp)
+    current_cover = exp.gdf.get("canopy_cover", np.zeros(len(exp.gdf)))
+
+    if canopy_scenario in [None, "none"]:
+        new_exp.gdf["canopy_cover"] = 0
+    elif canopy_scenario == "current":
+        new_exp.gdf["canopy_cover"] = current_cover
+    elif isinstance(canopy_scenario, (int, float)):
+        new_exp.gdf["canopy_cover"] = np.where(current_cover < canopy_scenario, canopy_scenario, current_cover)
+    else:
+        raise ValueError("Invalid canopy_scenario.")
+
+    return new_exp
+
+def adjust_hazard_with_exposure_modifier(
+    exposure,
+    hazard,
+    adjustment_fn,
+    adjustment_kwargs=None,
+    return_timings=False
+):
+    """
+    Apply a cell-wise reduction to hazard intensity values based on exposure info.
+
+    The `adjustment_fn` must return the REDUCTION (not the final value).
+
+    Parameters:
+    - exposure: Exposures object
+    - hazard: Hazard object
+    - adjustment_fn: Function returning an adjustment (subtracted from hazard values)
+        Signature:
+        def adjustment_fn(hazard_matrix, exposure_gdf, **kwargs) -> np.ndarray
+        Output shape must be:
+            - same as hazard_matrix (n_events x n_sites), or
+            - (n_sites,) — broadcasted across years
+    - adjustment_kwargs: Additional keyword arguments passed to `adjustment_fn`
+    - return_timings: If True, return timing info
+
+    Returns:
+    - adjusted_hazard: Hazard object
+    - timings (optional)
+    """
+    import time
+    from copy import deepcopy
+    from scipy import sparse
+
+    if adjustment_kwargs is None:
+        adjustment_kwargs = {}
+
+    timings = {}
+    t0 = time.time()
+
+    exposure_gdf = exposure.gdf
+    hazard_matrix = hazard.intensity.toarray()
+    timings["prepare_data"] = time.time() - t0
+
+    t0 = time.time()
+    reduction = adjustment_fn(
+        hazard_matrix=hazard_matrix,
+        exposure_gdf=exposure_gdf,
+        **adjustment_kwargs
+    )
+
+    if reduction.shape != hazard_matrix.shape and reduction.shape != (hazard_matrix.shape[1],):
+        raise ValueError("adjustment_fn must return shape [n_events x n_sites] or [n_sites]")
+
+    if reduction.ndim == 1:
+        reduction = np.tile(reduction, (hazard_matrix.shape[0], 1))
+
+    adjusted = hazard_matrix - reduction
+    adjusted[adjusted < 0] = 0
+    timings["adjustment_calc"] = time.time() - t0
+
+    t0 = time.time()
+    adjusted_hazard = deepcopy(hazard)
+    adjusted_hazard.intensity = sparse.csr_matrix(adjusted)
+    timings["packaging"] = time.time() - t0
+
+    if return_timings:
+        return adjusted_hazard, timings
+    return adjusted_hazard
+
+def helper_adj_fcn_canopy_vpd(
+    hazard_matrix,
+    exposure_gdf,
+    max_cooling=3.0,
+    plateau_at=80,
+    vpd_sensitivity=0.15
+):
+    """
+    Estimate VPD REDUCTION from canopy-based cooling.
+
+    Parameters:
+    - hazard_matrix: [n_events x n_sites] np.array (original VPD values)
+    - exposure_gdf: GeoDataFrame with 'canopy_cover' column (0–100%)
+    - max_cooling: °C, maximum temperature cooling (positive value)
+    - plateau_at: % canopy cover where max cooling is reached
+    - vpd_sensitivity: kPa per °C, e.g. 0.15 means 1°C → 0.15 kPa VPD drop
+
+    Returns:
+    - reduction: np.array of shape [n_sites] or [n_events x n_sites]
+    """
+    canopy = np.clip(exposure_gdf.get("canopy_cover", np.zeros(len(exposure_gdf))), 0, 100)
+
+    # Temperature reduction from canopy
+    slope = -max_cooling / plateau_at
+    temp_reduction = np.where(
+        canopy <= plateau_at,
+        slope * canopy,
+        -max_cooling
+    )  # shape: [n_sites]
+
+    # Convert to VPD reduction
+    vpd_reduction = -vpd_sensitivity * temp_reduction  # still positive
+    return vpd_reduction  # shape: [n_sites]
+
+def helper_adj_fcn_canopy_tmax(
+    hazard_matrix,
+    exposure_gdf,
+    max_cooling=2.5,
+    plateau_at=50
+):
+    """
+    Return REDUCTION in Tmax hazard intensity based on canopy cover,
+    using a linear-to-plateau cooling function.
+
+    Cooling is applied as:
+        - Linear up to `plateau_at` % canopy
+        - Constant `-max_cooling` beyond that
+
+    Parameters:
+    - hazard_matrix: np.array of shape [n_events x n_sites]
+    - exposure_gdf: GeoDataFrame with 'canopy_cover' column (0–100%)
+    - max_cooling: Maximum cooling in °C (positive, e.g. 2.5)
+    - plateau_at: Canopy cover % at which max_cooling is reached (e.g. 50)
+
+    Returns:
+    - reduction: np.array of shape [n_sites] or [n_events x n_sites]
+    """
+    canopy = exposure_gdf.get("canopy_cover", np.zeros(len(exposure_gdf)))
+    canopy = np.clip(canopy, 0, 100)
+
+    slope = -max_cooling / plateau_at
+    reduction = np.where(
+        canopy <= plateau_at,
+        slope * canopy,
+        -max_cooling
+    )
+
+    return reduction  # shape: [n_sites]
+
+
+import os
+from pathlib import Path
+import requests
+
+def download_if_missing(url, dest_folder, filename=None):
+    """
+    Download a file from `url` into `dest_folder` if not already present.
+
+    Parameters:
+    - url (str): Direct download URL to the file
+    - dest_folder (str or Path): Folder to save the file
+    - filename (str, optional): Custom filename (otherwise inferred from URL)
+
+    Returns:
+    - Path to the downloaded file
+    """
+    dest_folder = Path(dest_folder)
+    dest_folder.mkdir(parents=True, exist_ok=True)
+
+    if filename is None:
+        filename = url.split("/")[-1].split("?")[0]  # Clean URL artifacts
+    dest_path = dest_folder / filename
+
+    if dest_path.exists():
+        print(f"✅ File already exists: {dest_path}")
+    else:
+        print(f"⬇️ Downloading {filename} to {dest_path} ...")
+        response = requests.get(url, stream=True)
+        if response.status_code == 200:
+            with open(dest_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print("✅ Download completed.")
+        else:
+            raise Exception(f"❌ Failed to download: HTTP {response.status_code}")
+
+    return dest_path
+
+def generate_hansen_tile_urls_from_bounds(lat_min, lat_max, lon_min, lon_max):
+    """
+    Generate Hansen tile filenames and URLs based on bounding box.
+
+    Parameters:
+    - base_url (str): URL prefix ending with '/' (e.g., Dropbox folder, GEE repo)
+    - lat_min, lat_max (int): Latitude bounds in degrees (e.g., 10, 30)
+    - lon_min, lon_max (int): Longitude bounds in degrees (e.g., -110, -90)
+
+    Returns:
+    - dict: {filename: full_url}
+    """
+    tile_urls = {}
+    base_url = "https://storage.googleapis.com/earthenginepartners-hansen/GFC-2019-v1.7/"
+
+    # Loop over 10-degree tiles (based on naming convention)
+    for lat in range(lat_min, lat_max + 1, 10):
+        lat_dir = "N" if lat >= 0 else "S"
+        lat_str = f"{abs(lat):02d}{lat_dir}"
+
+        for lon in range(lon_min, lon_max + 1, 10):
+            lon_dir = "E" if lon >= 0 else "W"
+            lon_str = f"{abs(lon):03d}{lon_dir}"
+
+            filename = f"Hansen_GFC-2019-v1.7_treecover2000_{lat_str}_{lon_str}.tif"
+            tile_urls[filename] = f"{base_url}{filename}"
+
+    return tile_urls
+
+
+import xarray as xr
+import os
+from pathlib import Path
+import requests
+
+def download_terraclimate_data(
+    output_dir,
+    country_code="MEX",
+    lat_bounds=(32, 13),
+    lon_bounds=(-120, -85),
+    variables=("tmax", "vpd"),
+    years=range(1985, 2023),
+    download_type="historical",  # or "scenario"
+    scenario="plus2C",
+    scenario_prefix="2c",
+    skip_existing=True
+):
+    """
+    Download and crop TerraClimate data (historical or scenario).
+
+    Parameters:
+    - output_dir (str or Path): Destination folder
+    - country_code (str): Used in saved file names
+    - lat_bounds (tuple): (max_lat, min_lat)
+    - lon_bounds (tuple): (min_lon, max_lon)
+    - variables (iterable): List of variable names to download
+    - years (iterable): Range/list of years
+    - download_type (str): "historical" or "scenario"
+    - scenario (str): Scenario name for future data
+    - scenario_prefix (str): Prefix in filename (e.g., "2c" for plus2C)
+    - skip_existing (bool): If True, skip downloading files that already exist
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for var in variables:
+        for year in years:
+            if download_type == "historical":
+                url = f"http://thredds.northwestknowledge.net:8080/thredds/dodsC/TERRACLIMATE_ALL/data/TerraClimate_{var}_{year}.nc"
+                filename = f"TerraClimate_{var}_{year}_{country_code}.nc"
+            elif download_type == "scenario":
+                url = f"http://thredds.northwestknowledge.net:8080/thredds/fileServer/TERRACLIMATE_ALL/data_{scenario}/TerraClimate_{scenario_prefix}_{var}_{year}.nc"
+                filename = f"TerraClimate_{scenario}_{var}_{year}_{country_code}.nc"
+            else:
+                raise ValueError("Invalid download_type: must be 'historical' or 'scenario'.")
+
+            out_path = output_dir / filename
+            if skip_existing and out_path.exists():
+                print(f"✅ Skipping existing: {out_path.name}")
+                continue
+
+            print(f"🔄 Downloading {var} {year} for {country_code}...")
+
+            try:
+                if download_type == "historical":
+                    ds = xr.open_dataset(url)
+                else:
+                    tmp_path = output_dir / f"_tmp_{var}_{year}.nc"
+                    r = requests.get(url, timeout=60)
+                    r.raise_for_status()
+                    with open(tmp_path, "wb") as f:
+                        f.write(r.content)
+                    ds = xr.open_dataset(tmp_path)
+
+                ds = ds.assign_coords(lon=(((ds.lon + 180) % 360) - 180))  # Normalize
+                ds_crop = ds[var].sel(lat=slice(*lat_bounds), lon=slice(*lon_bounds))
+                ds_crop.to_netcdf(out_path)
+                print(f"✅ Saved: {out_path.name}")
+
+                if download_type == "scenario":
+                    tmp_path.unlink()
+
+            except Exception as e:
+                print(f"❌ Failed for {var} {year}: {e}")
+
+def print_summary_statistics(df, measure_names):
+    """
+    Print mean and 90% confidence intervals for AAI (present, future),
+    total climate risk, and cost-benefit metrics for each measure.
+    """
+    from tabulate import tabulate
+
+    def summarize(col):
+        data = df[col].dropna()
+        mean = data.mean()
+        ci_lower = data.quantile(0.05)
+        ci_upper = data.quantile(0.95)
+        return mean, ci_lower, ci_upper
+
+    rows = []
+
+    # --- AAI Risk Summary ---
+    base_present = "no measure - risk - present"
+    base_future = "no measure - risk - future"
+    rows.append(["AAI (Present)", "No measure", *summarize(base_present)])
+    rows.append(["AAI (Future)", "No measure", *summarize(base_future)])
+
+    for meas in measure_names:
+        rows.append(["AAI (Present)", meas, *summarize(f"{meas} - risk - present")])
+        rows.append(["AAI (Future)", meas, *summarize(f"{meas} - risk - future")])
+
+    # --- Total Climate Risk ---
+    rows.append(["Total Climate Risk", "All", *summarize("tot_climate_risk")])
+
+    # --- Cost, Benefit, Cost-Benefit Ratio ---
+    for meas in measure_names:
+        rows.append(["Cost (NPV)", meas, *summarize(f"{meas} - cost_meas - future")])
+        rows.append(["Benefit (NPV)", meas, *summarize(f"{meas} Benef")])
+        rows.append(["Cost-Benefit", meas, *summarize(f"{meas} CostBen")])
+
+    # --- Display table ---
+    print(tabulate(rows, headers=["Metric", "Scenario", "Mean", "5th Percentile", "95th Percentile"], floatfmt=".2f"))
+
+
+def plot_kde_panel(df, column_map, *, suptitle=None, value_format="${:,.0f}", figsize=(18, 5)):
+    """
+    General function for plotting 1xN KDE subplots from a dict of label → [columns].
+
+    Parameters:
+    - df: DataFrame with data
+    - column_map: OrderedDict or dict: subplot_title -> [(label, column_name)]
+    - value_format: formatter for mean values in legend
+    - suptitle: optional string
+    - figsize: tuple for figure size
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    n_subplots = len(column_map)
+    fig, axs = plt.subplots(1, n_subplots, figsize=figsize, sharey=False)
+    if n_subplots == 1:
+        axs = [axs]
+
+    palette = sns.color_palette("Set1", n_colors=10)
+
+    for ax, (title, entries) in zip(axs, column_map.items()):
+        for i, (label, col) in enumerate(entries):
+            if col in df.columns:
+                val = df[col].dropna()
+                if val.var() > 0:
+                    mean_val = val.mean()
+                    label_with_mean = f"{label} (mean: {value_format.format(mean_val)})"
+                    sns.kdeplot(val, ax=ax, label=label_with_mean,
+                                fill=True, color=palette[i], linewidth=2, alpha=0.3)
+                    ax.axvline(mean_val, color=palette[i], linestyle="--")
+        ax.set_title(title)
+        ax.set_xlabel("Value")
+        ax.set_ylabel("Density")
+        ax.grid(True)
+        ax.legend()
+
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=16)
+    plt.tight_layout()
     plt.show()
