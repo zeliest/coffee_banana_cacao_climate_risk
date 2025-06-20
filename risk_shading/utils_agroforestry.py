@@ -172,103 +172,100 @@ def simulate_agroforestry_plot(
     plot_size_weights=[0.3, 0.4, 0.2, 0.1]
 ):
     """
-    Simulates an agroforestry plot composition based on provided species characteristics
-    and environmental metadata.
+    Simulates an agroforestry plot composition keeping all species entries as-is,
+    even if species names repeat.
 
     Parameters:
         row: A GeoDataFrame row with geometry and satellite-derived columns: forest_cover, canopy_height, land_use_class.
-        plot_size_m2: Optional fixed plot size. If None, a random one is selected based on a distribution.
-        species_df: DataFrame with columns like 'species', 'height_min_m', 'height_max_m', 'type', 'cover_ratio', 'quantity' or 'probability'.
-        plot_size_distribution: List of (min, max) tuples for random plot size sampling.
-        plot_size_weights: Probabilities for each range.
-
+        plot_size_m2: Optional fixed plot size. If None, a random one is selected.
+        species_df: DataFrame with one row per species entry (even if repeated).
     Returns:
-        GeoDataFrame with one row per species in the simulated plot, including shading estimates and height bounds.
+        GeoDataFrame with one row per species entry in the simulated plot.
     """
 
     from shapely import wkt
     import random
     import numpy as np
     import geopandas as gpd
+    import pandas as pd
 
     geometry = wkt.loads(str(row.geometry))
     forest_cover = row.get("forest_cover", 0)
     canopy_height = row.get("canopy_height", None)
     land_use_class = row.get("land_use_class", "Unknown")
 
-    # --- Prepare species input ---
-    counts, heights, types, cover_ratios = {}, {}, {}, {}
-    height_mins, height_maxs = {}, {}
+    records = []
 
-    if species_df is not None and not species_df.empty:
-        for _, row_species in species_df.iterrows():
-            species = row_species["species"]
-            height_min = row_species.get("height_min_m", 5)
-            height_max = row_species.get("height_max_m", 15)
-            height = random.uniform(height_min, height_max)
-            type_ = row_species.get("type", "")
-            cover_ratio = row_species.get("cover_ratio", None)
-
-            if pd.notnull(row_species.get("quantity", None)):
-                n = int(row_species["quantity"])
-            elif pd.notnull(row_species.get("probability", None)):
-                if np.random.rand() < row_species["probability"]:
-                    n = np.random.randint(1, 6)
-                else:
-                    continue
-            else:
-                continue  # skip if neither quantity nor probability is defined
-
-            counts[species] = counts.get(species, 0) + n
-            heights[species] = height
-            height_mins[species] = height_min
-            height_maxs[species] = height_max
-            types[species] = type_
-            cover_ratios[species] = cover_ratio if pd.notnull(cover_ratio) else 1.5 * height  # simple fallback
-
-    if not counts:
-        return None
-
-    # --- Determine plot size ---
+    # Choose plot size
     if plot_size_m2 is None:
         r = random.choices(plot_size_distribution, weights=plot_size_weights)[0]
         plot_size_m2 = random.randint(r[0], r[1])
 
-    # --- Classify tree role ---
-    def infer_role(h):
-        if h >= 15:
-            return "upper canopy"
-        elif h >= 5:
-            return "mid canopy"
+    # Loop through all species entries
+    for idx, row_species in species_df.iterrows():
+        species = row_species["species"]
+        height_min = row_species.get("height_min_m", 5)
+        height_max = row_species.get("height_max_m", 15)
+        height = random.uniform(height_min, height_max)
+        type_ = row_species.get("type", "")
+        cover_ratio = row_species.get("cover_ratio", np.nan)
+
+        # Determine number of trees
+        if pd.notnull(row_species.get("quantity", None)):
+            try:
+                n = int(row_species["quantity"])
+                if n <= 0:
+                    continue
+            except:
+                continue
+        elif pd.notnull(row_species.get("probability", None)):
+            if np.random.rand() < row_species["probability"]:
+                n = np.random.randint(1, 6)
+            else:
+                continue
         else:
-            return "understory"
+            continue  # Skip if neither valid quantity nor probability
 
-    # --- Build output ---
-    output_dict = {
-        "species": list(counts.keys()),
-        "n_trees": [counts[s] for s in counts.keys()],
-        "height_m": [heights[s] for s in counts.keys()],
-        "height_min_m": [height_mins[s] for s in counts.keys()],
-        "height_max_m": [height_maxs[s] for s in counts.keys()],
-        "type": [types[s] for s in counts.keys()],
-        "cover_ratio": [cover_ratios[s] for s in counts.keys()],
-        "role": [infer_role(heights[s]) for s in counts.keys()],
-        "plot_size_m2": [plot_size_m2] * len(counts),
-        "forest_cover": [forest_cover] * len(counts),
-        "canopy_height": [canopy_height] * len(counts),
-        "land_use_class": [land_use_class] * len(counts),
-        "system_type": ["Agroforestry"] * len(counts),
-        "source": ["table"] * len(counts)
-    }
+        # Fallback for cover ratio
+        if pd.isnull(cover_ratio):
+            cover_ratio = 1.5 * height
 
-    gdf = gpd.GeoDataFrame(output_dict, geometry=[geometry] * len(counts), crs="EPSG:4326")
+        # Assign role
+        if height >= 15:
+            role = "upper canopy"
+        elif height >= 5:
+            role = "mid canopy"
+        else:
+            role = "understory"
 
-    # --- Calculate shading ---
+        records.append({
+            "species": species,
+            "n_trees": n,
+            "height_m": height,
+            "height_min_m": height_min,
+            "height_max_m": height_max,
+            "type": type_,
+            "cover_ratio": cover_ratio,
+            "role": role,
+            "plot_size_m2": plot_size_m2,
+            "forest_cover": forest_cover,
+            "canopy_height": canopy_height,
+            "land_use_class": land_use_class,
+            "system_type": "Agroforestry",
+            "source": "table",
+            "geometry": geometry
+        })
+
+    if not records:
+        return None
+
+    gdf = gpd.GeoDataFrame(records, crs="EPSG:4326")
+
+    # Shading calculations
     gdf["adjusted_cover_ratio"] = gdf["cover_ratio"] * gdf["n_trees"]
     gdf["adjusted_cover_area_m2"] = (gdf["adjusted_cover_ratio"] / 100) * gdf["plot_size_m2"]
     gdf["species_based_cover_area_m2"] = gdf["adjusted_cover_area_m2"]
 
-    # --- Estimate realistic forest-covered area ---
     total_simulated_cover_area = gdf["adjusted_cover_area_m2"].sum()
     satellite_forest_area = (forest_cover / 100) * plot_size_m2
     estimated_forest_cover_area = min(total_simulated_cover_area, satellite_forest_area)
@@ -276,7 +273,6 @@ def simulate_agroforestry_plot(
     gdf["estimated_forest_cover_area_m2"] = estimated_forest_cover_area
     gdf["expected_forest_area_m2"] = satellite_forest_area
 
-    # --- Estimate shading contribution per species (scaled) ---
     if total_simulated_cover_area > 0:
         gdf["shading_m2"] = (gdf["adjusted_cover_area_m2"] / total_simulated_cover_area) * estimated_forest_cover_area
     else:
@@ -563,31 +559,46 @@ def define_tc_impfs():
                                intensity=intensity, mdd=np.zeros(15), paa=np.zeros(15)))
     return impf_set
 
+
+
+
 def define_drought_impfs(spei_dict):
     impf_set = ImpactFuncSet()
     species_to_drought_id = {}
 
-    # Add a default fallback drought impact function with ID 0
+    # Default drought impact function with no impact before intensity 1.0
+    default_intensity = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
+    default_mdd =      np.array([0.0, 0.0, 0.0, 0.2, 0.4, 0.6])
+
     default_impf = ImpactFunc(
         haz_type="DR",
         id=0,
         name="Default drought response",
-        intensity=np.array([-2.5, -2.0, -1.5, -1.0, -0.5, 0.0]),
-        mdd=np.array([1.0, 0.8, 0.6, 0.4, 0.2, 0.0]),
-        paa=np.ones(6)
+        intensity=default_intensity,
+        mdd=default_mdd,
+        paa=np.ones_like(default_mdd)
     )
     default_impf.mdr = default_impf.mdd * default_impf.paa
     default_impf.check()
     impf_set.append(default_impf)
 
-    counter = 1  # Custom IDs start here
+    counter = 1
 
     for species, spei_range in spei_dict.items():
         ideal_min, ideal_max = spei_range["ideal"]
         tol_min, tol_max = spei_range["tolerable"]
 
-        intensity = np.array([tol_min - 0.5, tol_min, ideal_min, ideal_max, tol_max, tol_max + 0.5])
-        mdd = np.array([1.0, 0.8, 0.3, 0.0, 0.3, 0.5])
+        # SPEI values inverted to positive intensity values
+        spei_vals = [0.0, 0.5, 1.0, abs(ideal_min), abs(tol_min), abs(tol_min + 0.5)]
+        intensity = np.array(sorted(set([round(abs(v), 2) for v in spei_vals if v <= 2.5])))
+
+        # Match MDD: zero impact until intensity 1.0, then increase
+        mdd = np.piecewise(intensity,
+                           [intensity <= 1.0,
+                            (intensity > 1.0) & (intensity <= 1.5),
+                            (intensity > 1.5) & (intensity <= 2.0),
+                            intensity > 2.0],
+                           [0.0, 0.2, 0.4, 0.6])
 
         impf = ImpactFunc()
         impf.haz_type = "DR"
@@ -604,6 +615,8 @@ def define_drought_impfs(spei_dict):
         counter += 1
 
     return impf_set, species_to_drought_id
+
+
 
 
 def assign_impact_function_ids(df, species_to_temp_id, species_to_prec_id, species_to_drought_id=None):
